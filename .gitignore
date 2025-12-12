@@ -1,0 +1,12 @@
+venv/*
+.vscode/*
+__pycache__/
+Sub1/
+sub2/images/*
+sub2/models/*
+*/__pycache__/
+*/*/__pycache__/
+dataset/*
+Sub2/ex02_code_skeleton/ex02_test_values.pt
+.DS_Store
+
