@@ -18,8 +18,11 @@ def cosine_beta_schedule(timesteps, s=0.008):
     cosine schedule as proposed in https://arxiv.org/abs/2102.09672
     """
     # TODO (2.3): Implement cosine beta/variance schedule as discussed in the paper mentioned above
-    return torch.tensor(
+    alphabars = torch.tensor(
         [math.cos((t/timesteps + s)/(1+s) * (math.pi/2))**2 for t in range(timesteps)])
+    betas = torch.tensor([1 - (alphabars[t+1]/alphabars[t]) for t in range(timesteps-1)])
+    betas = torch.cat((betas, torch.tensor([0.999])),0)
+    return betas
 
 
 
@@ -63,7 +66,9 @@ class Diffusion:
 
         # define alphas
         # TODO
-        self.alphabars = torch.cumprod(1 - self.betas, dim=0)
+
+        self.alphas = 1 - self.betas
+        self.alphabars = torch.cumprod(self.alphas, dim=0)
 
 
         # calculations for diffusion q(x_t | x_{t-1}) and others
@@ -80,14 +85,16 @@ class Diffusion:
         # TODO (2.2): implement the reverse diffusion process of the model for (noisy) samples x and timesteps t. Note that x and t both have a batch dimension
 
         # Equation 11 in the paper
+        # Equation (8) in ex02 writeup
         # Use our model (noise predictor) to predict the mean
 
         predicted_noise = model.forward(x, t)
 
-        
+        z = torch.zeros_like(x) if t_index == 0 else torch.randn_like(x)
 
-        x_t_minus_1 = (1 / torch.sqrt(1-self.betas[t_index])) \
-                * (x - predicted_noise * self.betas[t_index]/torch.sqrt(1-self.alphabars[t_index]))
+        x_t_minus_1 = (1 / torch.sqrt(self.alphas[t_index])) \
+                * (x - predicted_noise * self.betas[t_index] / torch.sqrt(1-self.alphabars[t_index])) \
+                + torch.sqrt(self.betas[t_index]) * z
 
 
         # TODO (2.2): The method should return the image at timestep t-1.
