@@ -38,9 +38,9 @@ def sigmoid_beta_schedule(beta_start, beta_end, timesteps):
     for t in range(timesteps):
         x = -limit + (2*limit*t)/(timesteps)
         if t==0:
-            betas = torch.tensor([beta_start + (beta_end - beta_start) * (1/(1+torch.exp(-x)))])
+            betas = torch.tensor([beta_start + (beta_end - beta_start) * (1/(1+math.exp(-x)))])
         else:
-            betas = torch.cat((betas, torch.tensor([beta_start + (beta_end - beta_start) * (1/(1+torch.exp(-x)))])),0)
+            betas = torch.cat((betas, torch.tensor([beta_start + (beta_end - beta_start) * (1/(1+math.exp(-x)))])),0)
     return betas
 
 
@@ -107,9 +107,12 @@ class Diffusion:
         # TODO (2.2): Implement the full reverse diffusion loop from random noise to an image, iteratively ''reducing'' the noise in the generated image.
         size = (batch_size, channels, image_size[0], image_size[1])
 
-        x_t = torch.normal(mean=0,std=1,size=size, dtype=torch.float)
+        x_t = torch.normal(mean=0,std=1,size=size, dtype=torch.float).to(self.device)
         for t in range(self.timesteps):
-            x_t = self.p_sample(model,x_t,torch.tensor([t]*batch_size),t)
+            x_t = self.p_sample(model, x_t, torch.tensor([self.timesteps - t - 1]).to(self.device), self.timesteps - t - 1)
+            # x_t = self.p_sample(model,x_t,torch.tensor([t]*batch_size).to(self.device),t)
+
+            
 
         # TODO (2.2): Return the generated images
         return x_t
@@ -125,8 +128,9 @@ class Diffusion:
         # test2 = x_zero[test]
 
         x_t = (torch.sqrt(self.alphabars[t[0]])*x_zero[0] + torch.sqrt(1-self.alphabars[t[0]])*noise[0]).unsqueeze(0)
-
+        # x_t = x_t.to(self.device)
         for i in range(1,len(t)):
+
             x_t = torch.vstack((x_t, (torch.sqrt(self.alphabars[t[i]])*x_zero[i] + torch.sqrt(1-self.alphabars[t[i]])*noise[i]).unsqueeze(0)))
         
         # x_t = torch.sqrt(self.alphabars[t])*x_zero + torch.sqrt(1-self.alphabars[t])*noise
@@ -136,7 +140,7 @@ class Diffusion:
         # TODO (2.2): compute the input to the network using the forward diffusion process and predict the noise using the model; if noise is None, you will need to create a new noise vector, otherwise use the provided one.
 
         if noise== None:
-            noise = torch.normal(mean=0, std=1, size=x_zero.shape, dtype=torch.float)
+            noise = torch.normal(mean=0, std=1, size=x_zero.shape, dtype=torch.float).to(self.device)
 
 
         q_t = self.q_sample(x_zero, t, noise)

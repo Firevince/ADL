@@ -1,0 +1,53 @@
+import unittest
+import torch
+import os
+from numpy.testing import assert_almost_equal
+import sys
+from torchvision.utils import save_image
+import matplotlib.pyplot as plt
+from ex02_model import Unet
+import argparse
+# sys.path.append(os.path.abspath('ex02_code_skeleton'))
+
+from ex02_helpers import load_image
+from ex02_diffusion import Diffusion, linear_beta_schedule, cosine_beta_schedule, sigmoid_beta_schedule
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description='Train a neural network to diffuse images')
+
+    parser.add_argument('--scheduler', type=str, default="DDPM")
+    return parser.parse_args()
+
+def model_save_sample(device=torch.device("cuda" if torch.cuda.is_available() else "cpu")):
+    print("Testing sampling from pretrained model...")
+    image_size = 32  
+    channels = 3
+    schedule = "sigmoid"
+    # scheduler = lambda x: sigmoid_beta_schedule(0.0001, 0.02, x)
+    scheduler = None
+    if schedule == "linear":
+        scheduler = lambda x: linear_beta_schedule(0.001, 0.02, x)
+    if schedule ==  "cosine":
+        scheduler = lambda x: cosine_beta_schedule(x)
+    if schedule ==  "sigmoid":
+        scheduler = lambda x: sigmoid_beta_schedule(0.0001, 0.02, x)
+
+    model = Unet(dim=image_size, channels=channels, dim_mults=(1, 2, 4,)).to(device)
+    diffusor = Diffusion(timesteps=100,
+                            get_noise_schedule=scheduler,
+                            img_size=image_size,
+                            device=device)
+
+    checkpoint = torch.load(f"../models/DDPM/{schedule}_1.pt", map_location=device)
+    # print(checkpoint.keys())
+    model.load_state_dict(checkpoint)
+    model.to(device)
+    model.eval()
+
+    with torch.no_grad():
+        samples = diffusor.sample(model, image_size=(image_size, image_size), batch_size=32)
+        save_image(samples, f"../images/sampled_images_{schedule}.png", nrow=2)
+
+if __name__ == "__main__":
+    model_save_sample()
