@@ -10,7 +10,7 @@ from pathlib import Path
 import os
 
 from ex02_model import Unet
-from ex02_diffusion import Diffusion, linear_beta_schedule, cosine_beta_schedule
+from ex02_diffusion import Diffusion, linear_beta_schedule, cosine_beta_schedule, sigmoid_beta_schedule
 from torchvision.utils import save_image
 
 import argparse
@@ -32,9 +32,9 @@ def parse_args():
     return parser.parse_args()
 
 
-def sample_and_save_images(n_images, diffusor:Diffusion, model, device, store_path):
+def sample_and_save_images(n_images, diffusor:Diffusion, model, device, store_path, class_labels=None):
     # TODO: Implement - adapt code and method signature as needed
-    images_sampled = diffusor.sample(model, (32,32), n_images)
+    images_sampled = diffusor.sample(model, (32,32), n_images, class_labels=class_labels)
     for i in range(n_images):
         save_image(images_sampled[i], store_path+f"/sampled_image_{i}.png")
 
@@ -43,13 +43,20 @@ def test(model, testloader:DataLoader, diffusor:Diffusion, device, args):
     # TODO: Implement - adapt code and method signature as needed
 
     pbar = tqdm(testloader)
+    average_loss = 0
+
     for step, (images, labels) in enumerate(pbar):
         images = images.to(device)
+        labels = labels.to(device)
         t = torch.randint(0, diffusor.timesteps, (len(images),), device=device).long()
-        loss = diffusor.p_losses(model, images, t, loss_type="l2")
-        print('Test Loss: {:.6f}'.format(loss.item()))
+        loss = diffusor.p_losses(model, images, t, loss_type="l2", class_labels=labels)
+        # print('Test Loss: {:.6f}'.format(loss.item()))
+        average_loss += loss.item()
         if args.dry_run:
             break
+    average_loss /= (step+1)
+    print('Test Average Loss: {:.6f}'.format(average_loss))
+
 
 
 
@@ -58,24 +65,30 @@ def train(model, trainloader, optimizer, diffusor, epoch, device, args):
     timesteps = args.timesteps
 
     pbar = tqdm(trainloader)
+    average_loss = 0
     for step, (images, labels) in enumerate(pbar):
 
         images = images.to(device)
+        labels = labels.to(device)
         optimizer.zero_grad()
 
         # Algorithm 1 line 3: sample t uniformly for every example in the batch
         t = torch.randint(0, timesteps, (len(images),), device=device).long()
-        loss = diffusor.p_losses(model, images, t, loss_type="l2")
+        loss = diffusor.p_losses(model, images, t, loss_type="l2", class_labels=labels)
 
         loss.backward()
         optimizer.step()
 
-        if step % args.log_interval == 0:
-            print('Train Epoch: {} [{}/{} ({:.0f}%)]\tLoss: {:.6f}'.format(
-                epoch, step * len(images), len(trainloader.dataset),
-                100. * step / len(trainloader), loss.item()))
+        # if step % args.log_interval == 0:
+        #     print('Train Epoch: {} [{}/{} ({:.0f}%)]\tLoss: {:.6f}'.format(
+        #         epoch, step * len(images), len(trainloader.dataset),
+        #         100. * step / len(trainloader), loss.item()))
+        average_loss += loss.item()
         if args.dry_run:
             break
+    average_loss /= (step+1)
+    print('Train Epoch: {} \tAverage Loss: {:.6f}'.format(epoch, average_loss))
+   
 
 
 # def test(args):
@@ -92,10 +105,11 @@ def run(args):
     batch_size = args.batch_size
     device = "cuda" if not args.no_cuda and torch.cuda.is_available() else "cpu"
 
-    model = Unet(dim=image_size, channels=channels, dim_mults=(1, 2, 4,)).to(device)
+    model = Unet(dim=image_size, channels=channels, dim_mults=(1, 2, 4,), class_free_guidance=True, p_uncond=0.1, num_classes=10).to(device)
     optimizer = AdamW(model.parameters(), lr=args.lr)
 
-    my_scheduler = lambda x: cosine_beta_schedule(x)
+    # my_scheduler = lambda x: cosine_beta_schedule(x)
+    my_scheduler = lambda x: sigmoid_beta_schedule(0.0001, 0.02, x)
     diffusor = Diffusion(timesteps, my_scheduler, image_size, device)
 
     # define image transformations (e.g. using torchvision)
@@ -104,6 +118,7 @@ def run(args):
         transforms.ToTensor(),    # turn into torch Tensor of shape CHW, divide by 255
         transforms.Lambda(lambda t: (t * 2) - 1)   # scale data to [-1, 1] to aid diffusion process
     ])
+    
     reverse_transform = Compose([
         Lambda(lambda t: (t.clamp(-1, 1) + 1) / 2),
         Lambda(lambda t: t.permute(1, 2, 0)),  # CHW to HWC
@@ -112,13 +127,13 @@ def run(args):
         ToPILImage(),
     ])
 
-    dataset = datasets.CIFAR10('/Users/firevince/Projects/ADL/dataset', download=True, train=True, transform=transform)
+    dataset = datasets.CIFAR10('./dataset', download=True, train=True, transform=transform)
     trainset, valset = torch.utils.data.random_split(dataset, [int(len(dataset) * 0.9), len(dataset) - int(len(dataset) * 0.9)])
     trainloader = DataLoader(trainset, batch_size=batch_size, shuffle=True)
     valloader = DataLoader(valset, batch_size=batch_size, shuffle=False)
 
     # Download and load the test data
-    testset = datasets.CIFAR10('/Users/firevince/Projects/ADL/dataset', download=True, train=False, transform=transform)
+    testset = datasets.CIFAR10('./dataset', download=True, train=False, transform=transform)
     testloader = DataLoader(testset, batch_size=int(batch_size/2), shuffle=True)
 
     for epoch in range(epochs):
@@ -127,11 +142,13 @@ def run(args):
 
     test(model, testloader, diffusor, device, args)
 
-    save_path = "/Users/firevince/Projects/ADL/Sub2/images"  # TODO: Adapt to your needs
-    n_images = 8
-    sample_and_save_images(n_images, diffusor, model, device, save_path)
-    torch.save(model.state_dict(), os.path.join("/Users/firevince/Projects/ADL/Sub2/models", args.run_name, f"ckpt.pt"))
+    save_path = "./Sub2/images/"  # TODO: Adapt to your needs
+    n_images = 10
+    # every class once
+    image_classes = torch.tensor([i % 10 for i in range(n_images)]).to(device)
 
+    sample_and_save_images(n_images, diffusor, model, device, save_path, class_labels=image_classes)
+    torch.save(model.state_dict(), os.path.join("./Sub2/models", args.run_name, f"ckpt.pt"))
 
 if __name__ == '__main__':
     args = parse_args()
