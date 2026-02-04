@@ -1,10 +1,9 @@
 from ex03_model import ShallowCNN
 from ex03_main import run_generation, run_evaluation, parse_args, run_ood_analysis
 import torch
-import pytest
 device = torch.device("cuda:0") if torch.cuda.is_available() else torch.device("cpu")
 
-
+CHECKPOINT_PATH = "Sub3/JEM/lightning_logs/version_1/checkpoints/last_epoch=115-step=40948.ckpt"
 
 def test_shallow_cnn_forward():
     model = ShallowCNN(hidden_features=16, num_classes=10)
@@ -30,7 +29,7 @@ def test_shallow_cnn_get_logits():
 
 def test_generate_images():
     # checkpoint_path = "saved_models/lightning_logs/version_61/checkpoints/last_epoch=1-step=706.ckpt"
-    checkpoint_path = "JEM_3/lightning_logs/version_0/checkpoints/last_epoch=4-step=1765.ckpt"
+    checkpoint_path = CHECKPOINT_PATH
     num_steps = 120
     args = {'num_steps': num_steps}
     run_generation(args, checkpoint_path, conditional=False)
@@ -57,15 +56,15 @@ def test_pytorch_grad():
 
 
 def test_evaluation():
-    checkpoint_path = "JEM_5/lightning_logs/version_0/checkpoints/last_epoch=4-step=1765.ckpt"
+    checkpoint_path = CHECKPOINT_PATH
     args = parse_args()
     run_evaluation(args, checkpoint_path)
 
 def test_ood_analysis():
-    checkpoint_path = "JEM_5/lightning_logs/version_0/checkpoints/last_epoch=4-step=1765.ckpt"
+    checkpoint_path = CHECKPOINT_PATH
     args = parse_args()
     run_ood_analysis(args, checkpoint_path)
 
 
 if __name__ == "__main__":
-    test_ood_analysis()
+    test_generate_images()

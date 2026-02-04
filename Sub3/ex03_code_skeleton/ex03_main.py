@@ -1,40 +1,34 @@
 ## Standard libraries
 import os
 import numpy as np
-from pytest import param
 import tqdm
 import pandas as pd
 import argparse
 from typing import Union, Dict
-
 ## Imports for plotting
 import matplotlib.pyplot as plt
 import seaborn as sns
-
 ## Imports for data loading
 from pathlib import Path
-
 ## PyTorch & DL
 import torch
 import torch.utils.data as data
 import torch.optim as optim
 import torchmetrics
 import torchvision
-
+# pl
 import pytorch_lightning as pl
 from pytorch_lightning.callbacks import LearningRateMonitor, ModelCheckpoint
-
+## Misc
+from sklearn.metrics import roc_auc_score, average_precision_score, precision_recall_curve, auc
+# Custom imports
+from ex03_data import get_datasets, TransformTensorDataset
+from ex03_model import ShallowCNN
+from ex03_ood import score_fn
 # Deterministic operations on GPU
 torch.backends.cudnn.deterministic = True
 torch.backends.cudnn.benchmark = False
 device = torch.device("cuda:0") if torch.cuda.is_available() else torch.device("cpu")
-
-## Misc
-from sklearn.metrics import roc_auc_score, average_precision_score, precision_recall_curve, auc
-
-from ex03_data import get_datasets, TransformTensorDataset
-from ex03_model import ShallowCNN
-from ex03_ood import score_fn
 
 
 def parse_args():
@@ -99,7 +93,7 @@ class MCMCSampler:
                 combined = torch.cat([current_buffer, class_imgs], dim=0)
                 self.buffer[i] = combined[-self.cbuffer_size:]  # Keep only last cbuffer_size images
 
-    def synthesize_samples(self, clabel=None, steps=60, step_size=0.01, return_img_per_step=False):
+    def synthesize_samples(self, clabel=None, steps=60, step_size=10, return_img_per_step=False):
         """
         Synthesize images from the current parameterized q_\theta
 
@@ -155,31 +149,18 @@ class MCMCSampler:
             inp_imgs = torch.cat([inp_imgs, padding], dim=0)
 
         inp_imgs.requires_grad = True
-        # with torch.enable_grad():
-        #     self.model.train(True)
-        #     for param in self.model.cnn_layers.parameters():
-        #         param.requires_grad = True
-        #     for param in self.model.fc_layers.parameters():
-        #         param.requires_grad = True
-
-        #     out = inp_imgs
-        #     for i, layer in enumerate(self.model.cnn_layers):
-        #         out = layer(out)
-        #         print(f"Layer {i} ({layer.__class__.__name__}): Out grad_fn is {out.grad_fn}")
-        #         if out.grad_fn is None:
-        #             print("!!! THE CHAIN BROKE AT THE LAYER ABOVE !!!")
-        #             break
-
 
         # List for storing generations at each step
         imgs_per_step = []
 
 
         # Execute K MCMC steps
-        for _ in range(steps):
+        for step in range(steps):
             # (1) Add small noise to the input 'inp_imgs' (which are normalized to a range of -1 to 1).
             # This corresponds to the Brownian noise that allows to explore the entire parameter space.
-            noise = torch.randn_like(inp_imgs) * np.sqrt(step_size * 2) 
+            # noise = torch.randn_like(inp_imgs) * np.sqrt(step_size * 2) 
+            noise = torch.randn_like(inp_imgs) * 0.1
+
             with torch.no_grad():
                 inp_imgs += noise
 
@@ -294,15 +275,12 @@ class JEM(pl.LightningModule):
         #         reg_loss = self.hparams.alpha * (real_out ** 2 + synth_out ** 2).mean()
         #         cdiv_loss = ...
         #         loss = reg_loss + cdiv_loss
-        x, y = batch
-        e_px = self.forward(x, y).sum()
+        logits, y = batch
+        e_px = torch.logsumexp(logits, dim=1).sum()
         # self.train_metrics.update(e_px, y) 
 
-        q_x = self.sampler.synthesize_samples(clabel=y if ccond_sample else None, steps=self.hparams.steps,
-                                             step_size=self.hparams.step_size_decay).to(self.device)
+        q_x = self.sampler.synthesize_samples(clabel=y if ccond_sample else None, steps=self.hparams.steps).to(self.device)
         e_qx = self.forward(q_x).sum()
-
-
 
 
         reg_loss = self.hparams.alpha * (e_px ** 2 + e_qx ** 2)
@@ -312,14 +290,9 @@ class JEM(pl.LightningModule):
     def pyx_step(self, batch):
         # TODO (3.4): Implement p(y|x) step.
         # Here, we want to calculate the classification loss using the class logits infered by the neural network.
-        x, y = batch
-
-        e_xy = self.cnn.get_logits(x)
-
-        self.train_metrics.update(e_xy, y) 
-
-
-        p_yx = torch.softmax(e_xy, dim=1)
+        
+        logits, y = batch
+        p_yx = torch.softmax(logits, dim=1)
         loss = 1 - p_yx[range(len(y)), y] # gets 1 - p(y'=y|x) for each sample
         
         return loss
@@ -331,48 +304,31 @@ class JEM(pl.LightningModule):
         # Ideally, we only need to call the px_step() and pyx_step() methods and combine their loss terms to build up
         # the factorized joint density loss introduced by Gratwohl et al. .
 
-        # if batch_idx == 25:
-        #     a = 1
-        cdiv_loss, reg_loss = self.px_step(batch, ccond_sample=self.ccond_sample)
-        pyx_loss = self.pyx_step(batch) # both steps compute get_logits(x) 
+        x, y = batch
+        logits = self.cnn.get_logits(x)
+        self.train_metrics.update(logits, y)    
+
+        cdiv_loss, reg_loss = self.px_step((logits, y), ccond_sample=self.ccond_sample)
+        pyx_loss = self.pyx_step((logits, y)).sum() 
+
         loss = cdiv_loss + reg_loss + pyx_loss # TODO: is log nessecary?
         self.log_dict(self.train_metrics, on_step=False, on_epoch=True)
 
-        return loss.sum()
+        return loss
     
     def validation_step(self, batch, batch_idx, dataset_idx=None):
-        # Note: batch_idx and dataset_idx not needed (just there for PyTorch
-        # Lightning)
-        # TODO (3.4) 
-
         x, y = batch
-        # if x.shape[0] != self.batch_size:
-        #     a = 1
-        e_xy = self.cnn.get_logits(x)
-        if torch.isnan(e_xy).sum() > 0:
-            a = 1
 
-        self.valid_metrics.update(e_xy, y) 
-        cdiv_loss, reg_loss = self.px_step(batch, ccond_sample=self.ccond_sample)
-        pyx_loss = self.pyx_step(batch) # both steps compute get_logits(x) 
+        logits = self.cnn.get_logits(x)
+
+        self.valid_metrics.update(logits, y) 
+        cdiv_loss, reg_loss = self.px_step((logits, y), ccond_sample=self.ccond_sample)
+        pyx_loss = self.pyx_step((logits, y)) # both steps compute get_logits(x) 
         loss = torch.log(cdiv_loss + reg_loss) + torch.log(pyx_loss)
-        # multiclass_avg_prec = self.hp_metric(e_xy, y)
 
         self.log_dict(self.valid_metrics, on_step=False, on_epoch=True)
         self.log("val_contrastive_divergence", cdiv_loss, on_step=False, on_epoch=True)
-        # self.log("val_MulticlassAveragePrecision", multiclass_avg_prec, on_step=False, on_epoch=True)
         return loss.sum()
-
-
-        #self.log_dict(self.train_metrics, on_step=False, on_epoch=True)
-        #self.val_acc.update(log_probs, torch.argmax(label_batch.squeeze(), dim=1))
-
-
-        # self.log_dict(self.train_metrics, on_step=False, on_epoch=True)
-
-
-        # self.log('val_contrastive_divergence', val_loss.mean(), prog_bar=True, sync_dist=True)
-        # self.log('val_MulticlassAveragePrecision', self.hp_metric.compute(), prog_bar=True, sync_dist=True)
 
 def run_training(args) -> pl.LightningModule:
     """
@@ -420,6 +376,7 @@ def run_training(args) -> pl.LightningModule:
                              ModelCheckpoint(save_weights_only=True, filename='last_{epoch}-{step}'),
                              LearningRateMonitor("epoch")
                          ])
+    
     pl.seed_everything(42)
     model = JEM(num_epochs=num_epochs,
                 img_shape=(1, 56, 56),
@@ -543,6 +500,7 @@ def run_ood_analysis(args, ckpt_path: Union[str, Path]):
 
     # Datasets & Dataloaders
     batch_size = args.batch_size
+    img_shape=(1, 56, 56)
     data_dir = args.data_dir
     num_workers = args.num_workers
     datasets: Dict[str, TransformTensorDataset] = get_datasets(data_dir)
@@ -558,45 +516,74 @@ def run_ood_analysis(args, ckpt_path: Union[str, Path]):
 
     # TODO (3.6): Calculate and visualize the score distributions, e.g. with a histogram. Analyze whether we can
     #  visualy tell apart the different data distributions based on their assigned score.
-    for x, y in test_loader:
-        x.cuda()
-        y.to(model.device)
-        id_scores = score_fn(model, x, y, score='px')
+    model.cnn.to(device)
+    test_energies = torch.tensor([]).to(device)
+    for batch in test_loader:
+        x, y = batch
+        x = x.to(device)
+        energies = model.cnn.forward(x)
+        test_energies = torch.cat([test_energies, energies])
+
+    ood_ta_energies = torch.tensor([]).to(device)
+    for batch in ood_ta_loader:
+        x, y = batch
+        x = x.to(device)
+        energies = model.cnn.forward(x)
+        ood_ta_energies = torch.cat([ood_ta_energies, energies])
+
+    ood_tb_energies = torch.tensor([]).to(device)
+    for batch in ood_tb_loader:
+        x, y = batch
+        x = x.to(device)
+        energies = model.cnn.forward(x)
+        ood_tb_energies = torch.cat([ood_tb_energies, energies])
+
+    # Generate random noise batches and compute their energies
+    noise_energies = torch.tensor([]).to(device)
+    num_noise_batches = len(test_loader)
+    for _ in range(num_noise_batches):
+        noise = torch.normal(0, 1, (batch_size, *img_shape), device=device)
+        energies = model.cnn.forward(noise)
+        noise_energies = torch.cat([noise_energies, energies])
+
+    test_energies = test_energies.cpu().detach()
+    ood_ta_energies = ood_ta_energies.cpu().detach()
+    ood_tb_energies = ood_tb_energies.cpu().detach()
+    noise_energies = noise_energies.cpu().detach()
     
-    for x, y in ood_ta_loader:
-        x.to(model.device)
-        y.to(model.device)
-        ood_ta_scores = score_fn(model, x, y, score='px')
-    
-    for x, y in ood_tb_loader:
-        x.to(model.device)
-        y.to(model.device)
-        ood_tb_scores = score_fn(model, x, y, score='px')
-    
-    plt.figure(figsize=(10, 6))
-    sns.histplot(id_scores, color='blue', label='In-Distribution', stat='density', kde=True, bins=50, alpha=0.5)
-    sns.histplot(ood_ta_scores, color='green', label='OOD Type A', stat='density', kde=True, bins=50, alpha=0.5)
-    sns.histplot(ood_tb_scores, color='orange', label='OOD Type B', stat='density', kde=True, bins=50, alpha=0.5)
+    plt.figure(figsize=(24, 12))
+    plt.hist(test_energies, label='test', color='green',bins=100, edgecolor='black', alpha=0.5)
+    plt.hist(ood_tb_energies, label='ood_tb', color='blue',bins=100, edgecolor='black', alpha=0.5)
+    plt.hist(ood_ta_energies, label='ood_ta', color='red',bins=100, edgecolor='black', alpha=0.5)
+    plt.hist(noise_energies, label='noise', color='gray',bins=100, edgecolor='black', alpha=0.5)
     plt.xlabel('Energy Score')
-    plt.ylabel('Density')
-    plt.title('Score Distributions for In-Distribution and OOD Samples')
+    plt.ylabel('Frequency')
+    plt.title('Energy Score Distributions for Different Data Sources')
+
+    
     plt.legend()
-    plt.savefig('images_JEM/ood_score_distributions.png')
+    plt.savefig("images_JEM/distributions.png")
+    
 
     # TODO (3.6): Solve a binary classification on the soft scores and evaluate and AUROC and/or AUPRC score for
     #  discrimination between the training samples and one of the OOD distributions.
-    def compute_ood_metrics(id_scores, ood_scores):
-        y_true = np.concatenate([np.zeros_like(id_scores), np.ones_like(ood_scores)])
-        y_scores = np.concatenate([id_scores, ood_scores])
+    y_true = np.concatenate([
+    np.zeros(len(test_energies)),
+    np.ones(len(ood_ta_energies)),
+    np.ones(len(ood_tb_energies))
+    ])
 
-        auroc = roc_auc_score(y_true, -y_scores)  # Negate scores for AUROC
-        precision, recall, _ = precision_recall_curve(y_true, -y_scores)
-        auprc = auc(recall, precision)
+    y_score = np.concatenate([
+        test_energies.numpy(),
+        ood_ta_energies.numpy(),
+        ood_tb_energies.numpy()
+    ])
 
-        return auroc, auprc
-    
-    auroc_ta, auprc_ta = compute_ood_metrics(id_scores, ood_ta_scores)
-    auroc_tb, auprc_tb = compute_ood_metrics(id_scores, ood_tb_scores)
+    auroc = roc_auc_score(y_true, y_score)
+    auprc = average_precision_score(y_true, y_score)
+
+    print("AUROC:", auroc)
+    print("AUPRC:", auprc)
 
 
 if __name__ == '__main__':
